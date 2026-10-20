@@ -1,5 +1,5 @@
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, proto, getContentType } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode';
 import fs from 'fs';
@@ -15,21 +15,48 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json());
+
+// Fix encoding: paksa UTF-8 dan terima berbagai Content-Type
+app.use((req, res, next) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    next();
+});
+app.use(express.json({ type: ['application/json', 'text/plain', '*/*'] }));
+app.use(express.urlencoded({ extended: true }));
 
 const VALID_API_KEY = process.env.API_KEY || "";
 const PORT = process.env.PORT || 3000;
 
 const sessions = new Map();
 
+// Store pesan per sesi — dibutuhkan agar WhatsApp bisa retry dekripsi E2E
+// tanpa ini, penerima akan melihat "Menunggu pesan ini..."
+const messageStores = new Map();
+
 async function initSession(sessionId) {
     const sessionPath = path.join(__dirname, 'sessions', sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
+    // Inisialisasi store pesan untuk sesi ini
+    if (!messageStores.has(sessionId)) {
+        messageStores.set(sessionId, new Map());
+    }
+    const msgStore = messageStores.get(sessionId);
+
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' }) // Matikan log bawaan yang terlalu ramai
+        logger: pino({ level: 'silent' }),
+        // ✅ FIX UTAMA: Diperlukan agar WhatsApp server bisa meminta ulang
+        // pesan yang gagal didekripsi (Signal Protocol key ratchet retry)
+        getMessage: async (key) => {
+            const msgId = key.id;
+            if (msgStore.has(msgId)) {
+                return msgStore.get(msgId);
+            }
+            // Fallback: kembalikan pesan kosong agar tidak hang
+            return { conversation: '' };
+        }
     });
 
     sessions.set(sessionId, {
@@ -90,6 +117,22 @@ async function initSession(sessionId) {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Simpan setiap pesan yang berhasil dikirim ke store
+    // agar bisa di-retrieve saat WhatsApp meminta retry
+    sock.ev.on('messages.upsert', ({ messages }) => {
+        for (const msg of messages) {
+            if (msg.key?.id && msg.message) {
+                msgStore.set(msg.key.id, msg.message);
+
+                // Batasi ukuran store agar tidak memory leak (maks 500 pesan)
+                if (msgStore.size > 500) {
+                    const firstKey = msgStore.keys().next().value;
+                    msgStore.delete(firstKey);
+                }
+            }
+        }
+    });
 }
 
 // --- MIDDLEWARE API KEY ---
@@ -144,13 +187,81 @@ app.post('/api/send-message/:session_id', async (req, res) => {
     }
 
     const { number, message } = req.body;
-    const formattedNumber = number.startsWith('0') ? '62' + number.slice(1) + '@s.whatsapp.net' : number + '@s.whatsapp.net';
+
+    // Validasi input
+    if (!number || !message) {
+        return res.status(400).json({ error: 'Field "number" dan "message" wajib diisi' });
+    }
+
+    // Fix encoding: pastikan message adalah string UTF-8 yang valid
+    let safeMessage;
+    try {
+        // Jika message berupa Buffer atau salah encode, konversi ke string UTF-8
+        safeMessage = Buffer.from(String(message), 'utf-8').toString('utf-8');
+    } catch (e) {
+        return res.status(400).json({ error: 'Encoding pesan tidak valid, gunakan UTF-8' });
+    }
+
+    // Sanitasi nomor: hapus spasi, karakter tersembunyi, dan format yang tidak perlu
+    const cleanNumber = String(number).replace(/[\s\-().+]/g, '').trim();
+    const formattedNumber = cleanNumber.startsWith('0')
+        ? '62' + cleanNumber.slice(1) + '@s.whatsapp.net'
+        : cleanNumber + '@s.whatsapp.net';
+
+    console.log(`[${sessionId}] Kirim ke: ${formattedNumber} | Pesan: ${safeMessage.substring(0, 50)}...`);
 
     try {
-        await session.sock.sendMessage(formattedNumber, { text: message });
+        await session.sock.sendMessage(formattedNumber, { text: safeMessage });
         res.json({ success: true, message: 'Pesan berhasil dikirim' });
     } catch (error) {
         res.status(500).json({ error: 'Gagal mengirim pesan', detail: error.message });
+    }
+});
+
+// 4. Clear Cache Sesi (fix "Menunggu pesan ini...")
+// Menghapus session folder (auth keys) + message store di memori,
+// lalu reinisialisasi sesi agar dapat QR baru yang bersih
+app.post('/api/session/clear-cache/:session_id', async (req, res) => {
+    const sessionId = req.params.session_id;
+    const session = sessions.get(sessionId);
+    const sessionPath = path.join(__dirname, 'sessions', sessionId);
+
+    try {
+        // 1. Putuskan koneksi socket yang sedang berjalan
+        if (session?.sock) {
+            try {
+                session.sock.ev.removeAllListeners();
+                await session.sock.logout();
+            } catch (_) {
+                // Abaikan error logout, lanjutkan proses clear
+            }
+        }
+
+        // 2. Hapus dari memori
+        sessions.delete(sessionId);
+
+        // 3. Bersihkan message store sesi ini
+        if (messageStores.has(sessionId)) {
+            messageStores.get(sessionId).clear();
+            messageStores.delete(sessionId);
+        }
+
+        // 4. Hapus folder session di disk (auth keys & Signal Protocol state)
+        if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+            console.log(`[${sessionId}] Cache session dihapus dari disk.`);
+        }
+
+        // 5. Reinisialisasi sesi baru → akan generate QR baru
+        await initSession(sessionId);
+
+        res.json({
+            success: true,
+            message: `Cache sesi ${sessionId} berhasil dihapus. Silakan scan ulang QR melalui endpoint /status.`
+        });
+    } catch (error) {
+        console.error(`[${sessionId}] Gagal clear cache:`, error.message);
+        res.status(500).json({ error: 'Gagal membersihkan cache sesi', detail: error.message });
     }
 });
 
