@@ -55,7 +55,7 @@ async function initSession(sessionId) {
                 return msgStore.get(msgId);
             }
             // Fallback: kembalikan pesan kosong agar tidak hang
-            return { conversation: '' };
+            return { conversation: 'Pesan tidak ditemukan di cache lokal.' };
         }
     });
 
@@ -211,8 +211,17 @@ app.post('/api/send-message/:session_id', async (req, res) => {
     console.log(`[${sessionId}] Kirim ke: ${formattedNumber} | Pesan: ${safeMessage.substring(0, 50)}...`);
 
     try {
-        await session.sock.sendMessage(formattedNumber, { text: safeMessage });
-        res.json({ success: true, message: 'Pesan berhasil dikirim' });
+        const sentMsg = await session.sock.sendMessage(formattedNumber, { text: safeMessage });
+
+        // ✅ FIX PENTING: Simpan langsung ke msgStore agar `getMessage` bisa menemukannya saat di-retry oleh WA
+        if (sentMsg?.key?.id) {
+            const msgStore = messageStores.get(sessionId);
+            if (msgStore) {
+                // Format standar Baileys untuk disimpan di store
+                msgStore.set(sentMsg.key.id, sentMsg.message || { conversation: safeMessage });
+            }
+        }
+        res.json({ success: true, message: 'Pesan berhasil dikirim', data: sentMsg });
     } catch (error) {
         res.status(500).json({ error: 'Gagal mengirim pesan', detail: error.message });
     }
