@@ -1,5 +1,5 @@
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, proto, getContentType } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, proto, getContentType, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode';
 import fs from 'fs';
@@ -33,6 +33,18 @@ const sessions = new Map();
 // tanpa ini, penerima akan melihat "Menunggu pesan ini..."
 const messageStores = new Map();
 
+// Cache penghitung retry per sesi (dibutuhkan Baileys agar retry receipt tidak loop / hilang)
+const retryCaches = new Map();
+function createSimpleCache() {
+    const m = new Map();
+    return {
+        get: (k) => m.get(k),
+        set: (k, v) => { m.set(k, v); if (m.size > 5000) m.delete(m.keys().next().value); return true; },
+        del: (k) => m.delete(k),
+        flushAll: () => m.clear()
+    };
+}
+
 async function initSession(sessionId) {
     const sessionPath = path.join(__dirname, 'sessions', sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
@@ -43,10 +55,26 @@ async function initSession(sessionId) {
     }
     const msgStore = messageStores.get(sessionId);
 
+    if (!retryCaches.has(sessionId)) retryCaches.set(sessionId, createSimpleCache());
+
+    // Tutup socket lama (jika ada) agar tidak ada 2 socket memakai kunci Signal yang sama
+    const oldSession = sessions.get(sessionId);
+    if (oldSession?.sock) {
+        try { oldSession.sock.ev.removeAllListeners(); oldSession.sock.end(undefined); } catch (_) {}
+    }
+
+    const logger = pino({ level: 'silent' });
     const sock = makeWASocket({
-        auth: state,
+        auth: {
+            creds: state.creds,
+            // Cache + transaksi kunci: mencegah race-condition saat banyak pesan dikirim bersamaan
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
+        msgRetryCounterCache: retryCaches.get(sessionId),
+        syncFullHistory: false,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
+        markOnlineOnConnect: true,
+        logger,
         // ✅ FIX UTAMA: Diperlukan agar WhatsApp server bisa meminta ulang
         // pesan yang gagal didekripsi (Signal Protocol key ratchet retry)
         getMessage: async (key) => {
@@ -54,8 +82,9 @@ async function initSession(sessionId) {
             if (msgStore.has(msgId)) {
                 return msgStore.get(msgId);
             }
-            // Fallback: kembalikan pesan kosong agar tidak hang
-            return { conversation: 'Pesan tidak ditemukan di cache lokal.' };
+            // Jangan kirim pesan palsu: undefined membuat Baileys mengabaikan retry
+            // daripada mengirim ulang konten yang salah
+            return undefined;
         }
     });
 
@@ -86,7 +115,8 @@ async function initSession(sessionId) {
                 sessionData.status = 'RECONNECTING';
                 sessionData.number = null;
                 console.log(`[${sessionId}] Mencoba menghubungkan kembali...`);
-                initSession(sessionId); // Rekoneksi otomatis jika internet gangguan
+                // Beri jeda agar socket lama benar-benar tertutup sebelum membuat yang baru
+                setTimeout(() => initSession(sessionId), 3000);
             } else {
                 console.log(`[${sessionId}] Perangkat di-logout. Menunggu trigger manual dari sistem...`);
 
